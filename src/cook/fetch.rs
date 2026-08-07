@@ -122,7 +122,12 @@ pub fn fetch_offline(recipe: &CookRecipe, logger: &PtyOut) -> Result<FetchResult
                             );
                         }
                         create_dir(&source_dir)?;
-                        fetch_extract_tar(source_tar, &source_dir, logger)?;
+                        fetch_extract_tar(
+                            source_tar,
+                            &source_dir,
+                            logger,
+                            recipe.name.name() == "netsurf",
+                        )?;
                         fetch_apply_patches(recipe_dir, patches, script, &source_dir, logger)?;
                     } else {
                         // need to trust this tar file
@@ -434,7 +439,12 @@ pub fn fetch(recipe: &CookRecipe, check_source: bool, logger: &PtyOut) -> Result
                 // Create source.tmp
                 let source_dir_tmp = recipe_dir.join("source.tmp");
                 create_dir_clean(&source_dir_tmp)?;
-                fetch_extract_tar(source_tar, &source_dir_tmp, logger)?;
+                fetch_extract_tar(
+                    source_tar,
+                    &source_dir_tmp,
+                    logger,
+                    recipe.name.name() == "netsurf",
+                )?;
                 fetch_apply_patches(recipe_dir, patches, script, &source_dir_tmp, logger)?;
 
                 // Move source.tmp to source atomically
@@ -626,7 +636,20 @@ pub(crate) fn fetch_extract_tar(
     source_tar: PathBuf,
     source_dir_tmp: &PathBuf,
     logger: &PtyOut,
+    copy_links: bool,
 ) -> Result<()> {
+    // macOS VirtioFS cannot reliably create all symlinks from large source
+    // archives. Extract Netsurf on the container filesystem, then copy its
+    // resolved files to the mounted checkout.
+    let extract_dir = if copy_links {
+        let mut dir = std::env::temp_dir();
+        dir.push(format!("cookbook-tar-{}", std::process::id()));
+        create_dir_clean(&dir)?;
+        dir
+    } else {
+        source_dir_tmp.clone()
+    };
+
     let mut command = Command::new("tar");
     let verbose = crate::config::get_config().cook.verbose;
     if is_redox() {
@@ -634,15 +657,42 @@ pub(crate) fn fetch_extract_tar(
     } else {
         command.arg("--extract");
         command.arg("--no-same-owner");
+        command.arg("--no-same-permissions");
         if verbose {
             command.arg("--verbose");
         }
         command.arg("--file");
     }
     command.arg(&source_tar);
-    command.arg("--directory").arg(source_dir_tmp);
+    command.arg("--directory").arg(&extract_dir);
     command.arg("--strip-components").arg("1");
-    run_command(command, logger)?;
+    if let Err(error) = run_command(command, logger) {
+        if copy_links {
+            let _ = fs::remove_dir_all(&extract_dir);
+        }
+        return Err(error);
+    }
+
+    if copy_links {
+        let mut copy = Command::new("rsync");
+        copy.arg("-a")
+            .arg("--links")
+            .arg("--no-owner")
+            .arg("--no-group")
+            .arg("--no-perms")
+            .arg("--delete")
+            .arg(format!("{}/", extract_dir.display()))
+            .arg(format!("{}/", source_dir_tmp.display()));
+        if let Err(error) = run_command(copy, logger) {
+            let _ = fs::remove_dir_all(&extract_dir);
+            return Err(error);
+        }
+        fs::remove_dir_all(&extract_dir).map_err(wrap_io_err!(
+            &extract_dir,
+            "Removing temporary archive directory"
+        ))?;
+    }
+
     Ok(())
 }
 
